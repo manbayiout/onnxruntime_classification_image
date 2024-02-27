@@ -3,9 +3,5 @@
 
 # 忽略 node_modules 目录
 models/
+images/
 
-# 忽略临时文件
-temp/
-
-# 忽略特定文件
-config.ini
