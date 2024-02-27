@@ -256,7 +256,6 @@ void saveVideoProcess(void* ptr_img, named_mutex& mutex_img,
     // 定义视频编码器和写入对象
     int fourcc = cv::VideoWriter::fourcc('X', 'V', 'I', 'D');
     cv::Size frameSize(640, 480);  // 你需要根据相机数据的分辨率调整这里 
-    std::this_thread::sleep_for(std::chrono::milliseconds(22000));
     bool stop = false;
     std::vector<cv::Mat> imageVector;
     try{
