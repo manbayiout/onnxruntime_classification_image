@@ -19,34 +19,38 @@
 #include <fcntl.h>
 #include <sys/mman.h>
 #include <semaphore.h>
+#include <spdlog/spdlog.h>
+#include <spdlog/sinks/basic_file_sink.h>
 #include <hiredis/hiredis.h>
 #include <boost/interprocess/shared_memory_object.hpp>
 #include <boost/interprocess/mapped_region.hpp>
 #include <boost/interprocess/sync/scoped_lock.hpp>
 #include <boost/interprocess/sync/named_mutex.hpp>
 #include <boost/atomic.hpp>
+#include <boost/filesystem.hpp>
+#include <boost/asio.hpp>
 
-using namespace cv;     //当定义这一行后，cv::imread可以直接写成imread
+
+using namespace cv;
 using namespace std;
 using namespace Ort;
 using namespace cv::dnn;
 using namespace boost::interprocess;
+namespace fs = boost::filesystem;
 
 
-#define SHARED_MEM_SIZE 640*480*3*1200
 // Redis连接信息
 const char* redis_host = "127.0.0.1";
 const int redis_port = 6379;
+const char* resultKey = "result";
+//软件参数
 const int max_video_size = 600; // 设置列表的最大长度
-const char* listKey = "result";
 size_t imageSize = 640 * 480 *3;  //设置共享内存图像的大小
 boost::atomic<bool>* ptr_stop;  // 获取共享内存的指针，指向原子布尔变量
 named_mutex mutex_stop(open_or_create, "mutex_stop");  // 在互斥锁的保护下修改原子布尔变量
 
 
 void signalHandler(int signum) {
-    // 在信号处理函数中执行共享内存的读写操作
-
     // 如果是Ctrl+C信号(SIGINT)
     if (signum == SIGINT) {
         if (ptr_stop) {
@@ -54,8 +58,8 @@ void signalHandler(int signum) {
             *ptr_stop = true;
             lock.unlock();
         }
-
-        // 在信号处理函数中调用_exit，确保是异步安全的
+        std::this_thread::sleep_for(std::chrono::milliseconds(5000));  // 睡眠一定时间模拟推理耗时
+        
         _exit(EXIT_SUCCESS);
     }
 }
@@ -115,9 +119,30 @@ void cameraProcess(void* ptr_img, named_mutex& mutex_img) {
     cv::Mat image;
     bool ret;
     bool stop = false;
+
+    boost::asio::io_service io;
+    boost::asio::serial_port serial(io, "/dev/ttyUSB0");  // 替换为你的串口设备
+
+    // 配置串口参数
+    serial.set_option(boost::asio::serial_port_base::baud_rate(19200));
+    serial.set_option(boost::asio::serial_port_base::character_size(8));
+    serial.set_option(boost::asio::serial_port_base::parity(boost::asio::serial_port_base::parity::none));
+    serial.set_option(boost::asio::serial_port_base::stop_bits(boost::asio::serial_port_base::stop_bits::one));
     
     try{
         while (!stop) {
+            //获取当前stop信息
+            scoped_lock<named_mutex> lock_stop(mutex_stop);
+            stop = *ptr_stop;
+            lock_stop.unlock();
+            // 从串口读取数据
+            const int max_read_length = 128;
+            char data_to_read[max_read_length];
+            size_t read_length = boost::asio::read(serial, boost::asio::buffer(data_to_read, max_read_length));
+            
+            // 输出读取到的数据
+            std::cout << "Read from serial: " << std::string(data_to_read, read_length) << std::endl;
+
             ret = cap.read(image);
             if(image.empty()){
                 cout<<" no image in capture process"<<endl;
@@ -135,7 +160,8 @@ void cameraProcess(void* ptr_img, named_mutex& mutex_img) {
     }catch(std::exception& e){
         std::cerr << "Exception caught in Capture Process: " << e.what() << std::endl;
     }
-    redisFree(redisContext);   
+    redisFree(redisContext);  
+    std::cerr << "Capture Process ends" << std::endl; 
 }
 
 
@@ -148,7 +174,7 @@ void inferenceProcess(void* ptr_img, named_mutex& mutex_img,
         std::cerr << "Failed to connect to Redis: " << redisContext->errstr << std::endl;
         return ;
     }
-	std::this_thread::sleep_for(std::chrono::milliseconds(10000));  // 睡眠一定时间模拟推理耗时
+	std::this_thread::sleep_for(std::chrono::milliseconds(5000));  // 睡眠一定时间模拟推理耗时
     // 在这里加入初始化图像分类模型的代码
 	//environment （设置为VERBOSE（ORT_LOGGING_LEVEL_VERBOSE）时，方便控制台输出时看到是使用了cpu还是gpu执行）
 	Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "OnnxModel");
@@ -160,7 +186,7 @@ void inferenceProcess(void* ptr_img, named_mutex& mutex_img,
 	// ORT_ENABLE_ALL: 启用所有可能的优化
 	session_options.SetGraphOptimizationLevel(GraphOptimizationLevel::ORT_ENABLE_ALL);
 	//load  model and creat session
-	const char* model_path = "/home/pi/code/onnxruntime_deploy/claasify/weights/suiPian_mobilev3Small_448.onnx";
+	const char* model_path = "/home/pi/deploy/cpp/onnxruntime_classification_image/models/suiPian_shuffleNet_448.onnx";
 	Ort::Session session(env, model_path, session_options);
 	// print model input layer (node names, types, shape etc.)
 	Ort::AllocatorWithDefaultOptions allocator;
@@ -170,9 +196,7 @@ void inferenceProcess(void* ptr_img, named_mutex& mutex_img,
 	const char* output_name = "input";              
 	// 自动获取维度数量
 	auto input_dims = session.GetInputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
-	auto output_dims = session.GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();
-	std::cout << "input_dims:" << input_dims[0] << std::endl;
-	std::cout << "output_dims:" << output_dims[0] << std::endl;    
+	auto output_dims = session.GetOutputTypeInfo(0).GetTensorTypeAndShapeInfo().GetShape();    
 	std::vector<const char*> input_names{ input_name };
 	std::vector<const char*> output_names = { output_name };
 	std::vector<const char*> input_node_names = { "input" };
@@ -239,9 +263,11 @@ void inferenceProcess(void* ptr_img, named_mutex& mutex_img,
         // printf("\n current image classification : %d, possible : %.2f\n", classidx, classProb);
         endTime = clock();
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
-        std::cout << "The Inference time is:" << (double)(endTime - startTime) / CLOCKS_PER_SEC << "s" << std::endl;
+         std::cout << "The Inference time is:" << (double)(endTime - startTime) / CLOCKS_PER_SEC << "s" << std::endl;
+        // spdlog::info("The Inference time is:{}s", (double)(endTime - startTime) / CLOCKS_PER_SEC);
     }
     redisFree(redisContext);
+    std::cerr << "Inference Process ends" << std::endl;
 }
 
 void saveVideoProcess(void* ptr_img, named_mutex& mutex_img,
@@ -254,10 +280,11 @@ void saveVideoProcess(void* ptr_img, named_mutex& mutex_img,
         return ;
     }
     // 定义视频编码器和写入对象
-    int fourcc = cv::VideoWriter::fourcc('X', 'V', 'I', 'D');
+    int fourcc = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
     cv::Size frameSize(640, 480);  // 你需要根据相机数据的分辨率调整这里 
     bool stop = false;
     std::vector<cv::Mat> imageVector;
+    std::this_thread::sleep_for(std::chrono::milliseconds(8000));  // 睡眠一定时间模拟推理耗时
     try{
         while (!stop) {
             //获取当前stop信息
@@ -271,6 +298,7 @@ void saveVideoProcess(void* ptr_img, named_mutex& mutex_img,
             std::memcpy(image.data, ptr_img, imageSize);
             lock_img.unlock();
             imageVector.push_back(image);
+            std::this_thread::sleep_for(std::chrono::milliseconds(50));
             if (imageVector.size() <= max_video_size){
                 continue;
             }
@@ -290,13 +318,13 @@ void saveVideoProcess(void* ptr_img, named_mutex& mutex_img,
             std::cout << "recording:" <<endl;
             auto now = std::chrono::system_clock::now();
             auto now_c = std::chrono::system_clock::to_time_t(now);
-            std::string videoFileName = "output_" + std::to_string(now_c) + ".avi";
+            std::string videoFileName = "output_" + std::to_string(now_c) + ".mp4";
             cv::VideoWriter videoWriter(videoFileName, fourcc, 20, frameSize);
             for (const auto& originalMat : imageVector) {
                 videoWriter.write(originalMat);
             }
             videoWriter.release();
-            std::cout << "recording finished:" <<endl;
+            std::cout << "recording finished" <<endl;
 
             std::this_thread::sleep_for(std::chrono::milliseconds(5000));
         
@@ -304,7 +332,8 @@ void saveVideoProcess(void* ptr_img, named_mutex& mutex_img,
     }catch(std::exception& e){
         std::cerr << "Exception caught in Capture Process: " << e.what() << std::endl;
     }
-    redisFree(redisContext);	
+    redisFree(redisContext);
+    std::cerr << "Save Process ends" << std::endl;
 }
 
 
@@ -314,36 +343,42 @@ int main() {
         std::cerr << "Failed to set signal handler." << std::endl;
         return 1;
     }
-    // 创建共享内存对象
-    shared_memory_object shm_image(create_only, "shared_image", read_write);
-    // 设置共享内存对象的大小
-    shm_image.truncate(imageSize);
-    // 映射共享内存
-    mapped_region region_image(shm_image, read_write);
-    // 获取共享内存的指针
-    void* memPtr_image = region_image.get_address();
-    // 创建互斥锁
-    named_mutex mutex_image(open_or_create, "mutex_image");
-    // 创建共享内存对象
-    shared_memory_object shm_stop(create_only, "shared_stop", read_write);
-    // 设置共享内存对象的大小
-    shm_stop.truncate(sizeof(boost::atomic<bool>));
-    // 映射共享内存
-    mapped_region region_stop(shm_stop, read_write);
-    // 获取共享内存的指针，指向原子布尔变量
-    ptr_stop = new (region_stop.get_address()) boost::atomic<bool>(false);
-    // 创建共享内存对象
-    shared_memory_object shm_save(create_only, "shared_save", read_write);
-    // 设置共享内存对象的大小
-    shm_save.truncate(sizeof(boost::atomic<bool>));
-    // 映射共享内存
-    mapped_region region_save(shm_save, read_write);
-    // 获取共享内存的指针，指向原子布尔变量
-    boost::atomic<bool>* ptr_save = new (region_save.get_address()) boost::atomic<bool>(true);
-    // 在互斥锁的保护下修改原子布尔变量
-    named_mutex mutex_save(open_or_create, "mutex_save");
+    // // 设置进程安全的文件日志器，将日志记录到 "logfile.txt" 文件
+    // auto file_logger = spdlog::basic_logger_mt<spdlog::sinks::basic_file_sink_mt>("file_logger", "logfile.txt");
 
+    // // 设置全局默认日志器
+    // spdlog::set_default_logger(file_logger);
+    // file_logger->set_level(spdlog::level::trace);
+        
     try{
+        // 创建共享内存对象
+        shared_memory_object shm_image(create_only, "shared_image", read_write);
+        // 设置共享内存对象的大小
+        shm_image.truncate(imageSize);
+        // 映射共享内存
+        mapped_region region_image(shm_image, read_write);
+        // 获取共享内存的指针
+        void* memPtr_image = region_image.get_address();
+        // 创建互斥锁
+        named_mutex mutex_image(open_or_create, "mutex_image");
+        // 创建共享内存对象
+        shared_memory_object shm_stop(create_only, "shared_stop", read_write);
+        // 设置共享内存对象的大小
+        shm_stop.truncate(sizeof(boost::atomic<bool>));
+        // 映射共享内存
+        mapped_region region_stop(shm_stop, read_write);
+        // 获取共享内存的指针，指向原子布尔变量
+        ptr_stop = new (region_stop.get_address()) boost::atomic<bool>(false);
+        // 创建共享内存对象
+        shared_memory_object shm_save(create_only, "shared_save", read_write);
+        // 设置共享内存对象的大小
+        shm_save.truncate(sizeof(boost::atomic<bool>));
+        // 映射共享内存
+        mapped_region region_save(shm_save, read_write);
+        // 获取共享内存的指针，指向原子布尔变量
+        boost::atomic<bool>* ptr_save = new (region_save.get_address()) boost::atomic<bool>(true);
+        // 在互斥锁的保护下修改原子布尔变量
+        named_mutex mutex_save(open_or_create, "mutex_save");
         pid_t childPid1 = fork();
         if (childPid1 == 0){
             cout<<"run camera capture"<<endl;
@@ -374,13 +409,21 @@ int main() {
         waitpid(childPid2, &status, 0);
         waitpid(childPid3, &status, 0);
 
-    }
-    catch(const std::exception& e){
+    }catch (const boost::interprocess::interprocess_exception& e) {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-
-    }catch(...){
-        std::cerr << "Unknow Exception: " << std::endl;
+        if (shared_memory_object::remove("shared_image")) {
+            std::cout << "Shared memory object successfully removed." << std::endl;
+        }
+        if (shared_memory_object::remove("shared_stop")) {
+            std::cout << "Shared memory object successfully removed." << std::endl;
+        }
+        if (shared_memory_object::remove("shared_save")) {
+            std::cout << "Shared memory object successfully removed." << std::endl;
+        }
+    }catch(const std::exception& e){
+        std::cerr << "Exception caught: " << e.what() << std::endl;
     }
+
     std::cout << "Parent process, PID: " << getpid() << " waiting for all child processes to finish." << std::endl;
 
     return 0;  // 父进程结束
