@@ -255,6 +255,9 @@ fmt_DIR:PATH=/usr/lib/aarch64-linux-gnu/cmake/fmt
 //The directory containing a CMake configuration file for hiredis.
 hiredis_DIR:PATH=hiredis_DIR-NOTFOUND
 
+//The directory containing a CMake configuration file for serial.
+serial_DIR:PATH=serial_DIR-NOTFOUND
+
 //The directory containing a CMake configuration file for spdlog.
 spdlog_DIR:PATH=/usr/lib/aarch64-linux-gnu/cmake/spdlog
 
