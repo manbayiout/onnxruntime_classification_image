@@ -1,3 +1,0 @@
-/home/pi/deploy/cpp/onnxruntime_classification_image/build/CMakeFiles/BigDefectDetection.dir
-/home/pi/deploy/cpp/onnxruntime_classification_image/build/CMakeFiles/edit_cache.dir
-/home/pi/deploy/cpp/onnxruntime_classification_image/build/CMakeFiles/rebuild_cache.dir
