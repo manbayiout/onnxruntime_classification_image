@@ -42,7 +42,10 @@ namespace fs = boost::filesystem;
 // Redis连接信息
 const char* redis_host = "127.0.0.1";
 const int redis_port = 6379;
-const char* resultKey = "result";
+const char* resultKey = "result"; //检测结果
+const char* tempretureKey = "result"; //检测结果
+const char* humidityKey = "result"; //检测结果
+const char* dustKey = "result"; //检测结果
 //软件参数
 const int max_video_size = 600; // 设置列表的最大长度
 size_t imageSize = 640 * 480 *3;  //设置共享内存图像的大小
@@ -92,14 +95,8 @@ void PreProcess(const Mat& image, Mat& image_blob)
 }
 
 
-void cameraProcess(void* ptr_img, named_mutex& mutex_img) {
-    // 连接redis
-    redisContext* redisContext = redisConnect("127.0.0.1", 6379);
-    if (redisContext && redisContext->err) {
-        std::cerr << "Failed to connect to Redis: " << redisContext->errstr << std::endl;
-        return ;
-    }
-
+void cameraProcess(void* ptr_img, named_mutex& mutex_img,
+                long* ptr_nums, named_mutex& mutex_nums) {
     // 打开摄像头
     cv::VideoCapture cap(0, cv::CAP_V4L); 
 	if (!cap.isOpened()) {
@@ -113,6 +110,48 @@ void cameraProcess(void* ptr_img, named_mutex& mutex_img) {
     cap.set(cv::CAP_PROP_FRAME_HEIGHT, newHeight);
 	double desired_fps = 20.0;  // 你想要设置的帧率
 	cap.set(cv::CAP_PROP_FPS, desired_fps);
+
+    bool stop = false;
+    cv::Mat image;
+    bool ret;
+    
+    try{
+        while (!stop) {
+            //获取当前stop信息
+            scoped_lock<named_mutex> lock_stop(mutex_stop);
+            stop = *ptr_stop;
+            lock_stop.unlock();
+            
+            ret = cap.read(image);
+            if(image.empty()){
+                cout<<" no image in capture process"<<endl;
+                continue;
+            }
+
+            scoped_lock<named_mutex> lock_img(mutex_img);
+            // 将图像数据拷贝到共享内存
+            std::memcpy(ptr_img, image.data, imageSize);
+            lock_img.unlock();
+            scoped_lock<named_mutex> lock_nums(mutex_nums);
+            *ptr_nums += 1;
+            lock_nums.unlock();
+
+        }  
+    }catch(std::exception& e){
+        std::cerr << "Exception caught in Capture Process: " << e.what() << std::endl;
+    }
+
+    std::cerr << "Capture Process ends" << std::endl; 
+}
+
+
+void serialProcess(long* ptr_run, named_mutex& mutex_run) {
+    // 连接redis
+    redisContext* redisContext = redisConnect(redis_host, redis_port);
+    if (redisContext && redisContext->err) {
+        std::cerr << "Failed to connect to Redis: " << redisContext->errstr << std::endl;
+        return ;
+    }
     
     // 设置redis写入参数
 	const char* command = "SET %s %b";
@@ -135,46 +174,62 @@ void cameraProcess(void* ptr_img, named_mutex& mutex_img) {
             scoped_lock<named_mutex> lock_stop(mutex_stop);
             stop = *ptr_stop;
             lock_stop.unlock();
+
             // 从串口读取数据
-            const int max_read_length = 128;
+            const int max_read_length = 1;   
             char data_to_read[max_read_length];
             size_t read_length = boost::asio::read(serial, boost::asio::buffer(data_to_read, max_read_length));
+            // // 输出读取到的数据
+            // std::cout << "Read from serial: " << std::string(data_to_read, read_length) << std::endl;
             
-            // 输出读取到的数据
-            std::cout << "Read from serial: " << std::string(data_to_read, read_length) << std::endl;
+            if (data_to_read[0] == 'X'){
+                char data[7];
+                size_t length = boost::asio::read(serial, boost::asio::buffer(data, 7));
+                std::cout << "Read from serial: " << std::string(data, length) << std::endl;
+                // 设置多个键值对
+                const char *key_value_pairs[] = {"tempreture", (std::string(1, data[0]) + std::string(1, data[1])).c_str(), 
+                                                "humidity", (std::string(1, data[2]) + std::string(1, data[3])).c_str(),
+                                                "dust", (std::string(1, data[4]) + std::string(1, data[6])).c_str()};
+                int num_pairs = sizeof(key_value_pairs) / sizeof(key_value_pairs[0]);
+                const char *argv[num_pairs * 2 + 1];
+                argv[0] = "MSET";
+                for (int i = 0; i < num_pairs; ++i) {
+                    argv[i * 2 + 1] = key_value_pairs[i * 2];
+                    argv[i * 2 + 2] = key_value_pairs[i * 2 + 1];
+                }
 
-            ret = cap.read(image);
-            if(image.empty()){
-                cout<<" no image in capture process"<<endl;
-                continue;
+                // 发送 MSET 命令
+                redisReply *reply = (redisReply *)redisCommandArgv(redisContext, num_pairs + 1, argv, NULL);
+                if (reply == NULL) {
+                    printf("Command execution error\n");
+
+                }
+            }else if (data_to_read[0] == 'C'){
+                scoped_lock<named_mutex> lock_run(mutex_run);
+                // 将图像数据拷贝到共享内存
+                *ptr_run += 1;
+                lock_run.unlock();
             }
-            // 等待互斥锁
-            scoped_lock<named_mutex> lock_img(mutex_img);
-            // 将图像数据拷贝到共享内存
-            std::memcpy(ptr_img, image.data, imageSize);
-            // 解锁互斥锁
-            lock_img.unlock();
-
-            std::this_thread::sleep_for(std::chrono::milliseconds(10));  // 睡眠一定时间模拟推理耗时
         }  
     }catch(std::exception& e){
-        std::cerr << "Exception caught in Capture Process: " << e.what() << std::endl;
+        std::cerr << "Exception caught in Serial Process: " << e.what() << std::endl;
     }
     redisFree(redisContext);  
-    std::cerr << "Capture Process ends" << std::endl; 
+    std::cerr << "Serial Process ends" << std::endl; 
 }
 
 
 void inferenceProcess(void* ptr_img, named_mutex& mutex_img,
                      boost::atomic<bool>* ptr_stop, named_mutex& mutex_stop,
-                     boost::atomic<bool>* ptr_save, named_mutex& mutex_save) {
+                     boost::atomic<bool>* ptr_save, named_mutex& mutex_save,
+                     long* ptr_run, named_mutex& mutex_run) {
     // 连接redis
-    redisContext* redisContext = redisConnect("127.0.0.1", 6379);
+    redisContext* redisContext = redisConnect(redis_host, redis_port);
     if (redisContext && redisContext->err) {
         std::cerr << "Failed to connect to Redis: " << redisContext->errstr << std::endl;
         return ;
     }
-	std::this_thread::sleep_for(std::chrono::milliseconds(5000));  // 睡眠一定时间模拟推理耗时
+	// std::this_thread::sleep_for(std::chrono::milliseconds(5000));  // 睡眠一定时间模拟推理耗时
     // 在这里加入初始化图像分类模型的代码
 	//environment （设置为VERBOSE（ORT_LOGGING_LEVEL_VERBOSE）时，方便控制台输出时看到是使用了cpu还是gpu执行）
 	Ort::Env env(ORT_LOGGING_LEVEL_WARNING, "OnnxModel");
@@ -203,6 +258,9 @@ void inferenceProcess(void* ptr_img, named_mutex& mutex_img,
 	std::vector<const char*> output_node_names = { "output"};
 	cv::Mat frame;
     bool stop = false;
+    long nums = 0;
+    long bad = 0;
+    bool run = false;
     while (!stop) {
         //获取当前stop信息
         scoped_lock<named_mutex> lock_stop(mutex_stop);
@@ -210,7 +268,17 @@ void inferenceProcess(void* ptr_img, named_mutex& mutex_img,
         lock_stop.unlock();
         clock_t startTime, endTime;
         startTime = clock();
-        // 等待互斥锁
+
+        //查看是否有传感器触发
+        scoped_lock<named_mutex> lock_run(mutex_run);
+        if (*ptr_run != nums){
+            nums = *ptr_run;
+            lock_run.unlock();
+        }else{
+            lock_run.unlock();
+            continue;
+        }
+        
         scoped_lock<named_mutex> lock_img(mutex_img);
         // 从共享内存读取图像数据
         cv::Mat image(Size(640, 480), CV_8UC3);
@@ -258,6 +326,13 @@ void inferenceProcess(void* ptr_img, named_mutex& mutex_img,
             scoped_lock<named_mutex> lock_save(mutex_save);
             *ptr_save = true;
             lock_save.unlock();
+            bad += 1;
+            redisReply *reply = (redisReply *)redisCommand(redisContext, "SET %s %d", resultKey, bad);
+            if (reply == NULL) {
+                printf("Error in SET command: %s\n", redisContext->errstr);
+            }
+            printf("SET command reply: %s\n", reply->str);
+            freeReplyObject(reply);
         }
         // printf("\n current image classification : %s, possible : %.2f\n", labels.at(classidx).c_str(), classProb);
         // printf("\n current image classification : %d, possible : %.2f\n", classidx, classProb);
@@ -272,25 +347,37 @@ void inferenceProcess(void* ptr_img, named_mutex& mutex_img,
 
 void saveVideoProcess(void* ptr_img, named_mutex& mutex_img,
                      boost::atomic<bool>* ptr_stop, named_mutex& mutex_stop,
-                     boost::atomic<bool>* ptr_save, named_mutex& mutex_save) {
+                     boost::atomic<bool>* ptr_save, named_mutex& mutex_save,
+                     long* ptr_nums, named_mutex& mutex_nums) {
     // 连接redis
-    redisContext* redisContext = redisConnect("127.0.0.1", 6379);
+    redisContext* redisContext = redisConnect(redis_host, redis_port);
     if (redisContext && redisContext->err) {
         std::cerr << "Failed to connect to Redis: " << redisContext->errstr << std::endl;
         return ;
     }
     // 定义视频编码器和写入对象
-    int fourcc = cv::VideoWriter::fourcc('M', 'J', 'P', 'G');
+    int fourcc = cv::VideoWriter::fourcc('M', 'P', '4', 'V');
     cv::Size frameSize(640, 480);  // 你需要根据相机数据的分辨率调整这里 
     bool stop = false;
+    long nums = 0;
     std::vector<cv::Mat> imageVector;
-    std::this_thread::sleep_for(std::chrono::milliseconds(8000));  // 睡眠一定时间模拟推理耗时
+    // std::this_thread::sleep_for(std::chrono::milliseconds(8000));  // 睡眠一定时间模拟推理耗时
     try{
         while (!stop) {
             //获取当前stop信息
             scoped_lock<named_mutex> lock_stop(mutex_stop);
             stop = *ptr_stop;
             lock_stop.unlock();
+
+            //查看图像是否更新
+            scoped_lock<named_mutex> lock_nums(mutex_nums);
+            if (*ptr_nums != nums){
+                nums = *ptr_nums;
+                lock_nums.unlock();
+            }else{
+                lock_nums.unlock();
+                continue;
+            }
 
             // 读取数据
             scoped_lock<named_mutex> lock_img(mutex_img);
@@ -317,8 +404,10 @@ void saveVideoProcess(void* ptr_img, named_mutex& mutex_img,
             //保存视频
             std::cout << "recording:" <<endl;
             auto now = std::chrono::system_clock::now();
-            auto now_c = std::chrono::system_clock::to_time_t(now);
-            std::string videoFileName = "output_" + std::to_string(now_c) + ".mp4";
+            std::time_t currentTime = std::chrono::system_clock::to_time_t(now);
+            std::ostringstream oss;
+            oss << std::put_time(std::localtime(&currentTime), "%Y-%m-%d_%H-%M-%S") << ".mp4";
+            std::string videoFileName = oss.str();
             cv::VideoWriter videoWriter(videoFileName, fourcc, 20, frameSize);
             for (const auto& originalMat : imageVector) {
                 videoWriter.write(originalMat);
@@ -379,28 +468,62 @@ int main() {
         boost::atomic<bool>* ptr_save = new (region_save.get_address()) boost::atomic<bool>(true);
         // 在互斥锁的保护下修改原子布尔变量
         named_mutex mutex_save(open_or_create, "mutex_save");
+        // 创建共享内存对象
+        shared_memory_object shm_nums(boost::interprocess::create_only,
+            "shared_nums", boost::interprocess::read_write         
+        );
+        // 设置共享内存对象的大小
+        shm_nums.truncate(sizeof(long));
+        // 映射共享内存
+        mapped_region region_nums(shm_nums, read_write);
+        // 获取共享内存的指针
+        long* shared_nums = static_cast<long*>(region_nums.get_address());
+        // 在共享内存中写入数据
+        *shared_nums = 0;
+        named_mutex mutex_nums(open_or_create, "mutex_nums");
+        // 创建共享内存对象
+        shared_memory_object shm_run(boost::interprocess::create_only,
+            "shared_run", boost::interprocess::read_write         
+        );
+        // 设置共享内存对象的大小
+        shm_run.truncate(sizeof(long));
+        // 映射共享内存
+        mapped_region region_run(shm_run, read_write);
+        // 获取共享内存的指针
+        long* shared_run = static_cast<long*>(region_run.get_address());
+        // 在共享内存中写入数据
+        *shared_run = 0;
+        named_mutex mutex_run(open_or_create, "mutex_run");
+
         pid_t childPid1 = fork();
         if (childPid1 == 0){
             cout<<"run camera capture"<<endl;
-            cameraProcess(memPtr_image, mutex_image);
+            cameraProcess(memPtr_image, mutex_image,
+                        shared_nums, mutex_nums);
             return 0;
         }
-
         pid_t childPid2 = fork();
         if (childPid2 == 0){
+            cout<<"run  serial"<<endl;
+            serialProcess(shared_run, mutex_run);
+            return 0;
+        }
+        pid_t childPid3 = fork();
+        if (childPid3 == 0){
             cout<<"run  inference"<<endl;
             inferenceProcess(memPtr_image, mutex_image,
                             ptr_stop, mutex_stop,
-                            ptr_save, mutex_save);
+                            ptr_save, mutex_save,
+                            shared_run, mutex_run);
             return 0;
         }
-
-        pid_t childPid3 = fork();
-        if (childPid3 == 0){
+        pid_t childPid4 = fork();
+        if (childPid4 == 0){
         	cout<<"run video save"<<endl;
         	saveVideoProcess(memPtr_image, mutex_image,
                             ptr_stop, mutex_stop,
-                            ptr_save, mutex_save);
+                            ptr_save, mutex_save,
+                            shared_nums, mutex_nums);
         	return 0;
         }
 
@@ -408,6 +531,7 @@ int main() {
         waitpid(childPid1, &status, 0);
         waitpid(childPid2, &status, 0);
         waitpid(childPid3, &status, 0);
+        waitpid(childPid4, &status, 0);
 
     }catch (const boost::interprocess::interprocess_exception& e) {
         std::cerr << "Exception caught: " << e.what() << std::endl;
@@ -418,6 +542,9 @@ int main() {
             std::cout << "Shared memory object successfully removed." << std::endl;
         }
         if (shared_memory_object::remove("shared_save")) {
+            std::cout << "Shared memory object successfully removed." << std::endl;
+        }
+        if (shared_memory_object::remove("shared_nums")) {
             std::cout << "Shared memory object successfully removed." << std::endl;
         }
     }catch(const std::exception& e){
