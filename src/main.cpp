@@ -43,14 +43,33 @@ namespace fs = boost::filesystem;
 const char* redis_host = "127.0.0.1";
 const int redis_port = 6379;
 const char* resultKey = "result"; //检测结果
-const char* tempretureKey = "result"; //检测结果
-const char* humidityKey = "result"; //检测结果
-const char* dustKey = "result"; //检测结果
 //软件参数
 const int max_video_size = 600; // 设置列表的最大长度
 size_t imageSize = 640 * 480 *3;  //设置共享内存图像的大小
 boost::atomic<bool>* ptr_stop;  // 获取共享内存的指针，指向原子布尔变量
 named_mutex mutex_stop(open_or_create, "mutex_stop");  // 在互斥锁的保护下修改原子布尔变量
+
+
+class RedisConnection {
+public:
+    RedisConnection(const char* host, int port) : context_(redisConnect(host, port)) {
+        if (context_ && context_->err) {
+            throw std::runtime_error("Failed to connect to Redis: " + std::string(context_->errstr));
+        }
+    }
+
+    ~RedisConnection() {
+        redisFree(context_);
+    }
+
+    redisContext* getContext() const {
+        return context_;
+    }
+
+private:
+    redisContext* context_;
+};
+
 
 
 void signalHandler(int signum) {
@@ -61,9 +80,6 @@ void signalHandler(int signum) {
             *ptr_stop = true;
             lock.unlock();
         }
-        std::this_thread::sleep_for(std::chrono::milliseconds(5000));  // 睡眠一定时间模拟推理耗时
-        
-        _exit(EXIT_SUCCESS);
     }
 }
 
@@ -140,21 +156,14 @@ void cameraProcess(void* ptr_img, named_mutex& mutex_img,
     }catch(std::exception& e){
         std::cerr << "Exception caught in Capture Process: " << e.what() << std::endl;
     }
-
+    cap.release();
     std::cerr << "Capture Process ends" << std::endl; 
 }
 
 
 void serialProcess(long* ptr_run, named_mutex& mutex_run) {
     // 连接redis
-    redisContext* redisContext = redisConnect(redis_host, redis_port);
-    if (redisContext && redisContext->err) {
-        std::cerr << "Failed to connect to Redis: " << redisContext->errstr << std::endl;
-        return ;
-    }
     
-    // 设置redis写入参数
-	const char* command = "SET %s %b";
     cv::Mat image;
     bool ret;
     bool stop = false;
@@ -169,6 +178,8 @@ void serialProcess(long* ptr_run, named_mutex& mutex_run) {
     serial.set_option(boost::asio::serial_port_base::stop_bits(boost::asio::serial_port_base::stop_bits::one));
     
     try{
+        RedisConnection redisConnection(redis_host, redis_port);
+        redisContext* redisContext = redisConnection.getContext();
         while (!stop) {
             //获取当前stop信息
             scoped_lock<named_mutex> lock_stop(mutex_stop);
@@ -179,17 +190,19 @@ void serialProcess(long* ptr_run, named_mutex& mutex_run) {
             const int max_read_length = 1;   
             char data_to_read[max_read_length];
             size_t read_length = boost::asio::read(serial, boost::asio::buffer(data_to_read, max_read_length));
-            // // 输出读取到的数据
-            // std::cout << "Read from serial: " << std::string(data_to_read, read_length) << std::endl;
             
             if (data_to_read[0] == 'X'){
                 char data[7];
                 size_t length = boost::asio::read(serial, boost::asio::buffer(data, 7));
                 std::cout << "Read from serial: " << std::string(data, length) << std::endl;
+                std::string temperature_str = std::string(1, data[0]) + data[1];
+                std::string humidity_str = std::string(1, data[2]) + data[3];
+                std::string dust_str = std::string(1, data[4]) + data[5] + data[6];
+
                 // 设置多个键值对
-                const char *key_value_pairs[] = {"tempreture", (std::string(1, data[0]) + std::string(1, data[1])).c_str(), 
-                                                "humidity", (std::string(1, data[2]) + std::string(1, data[3])).c_str(),
-                                                "dust", (std::string(1, data[4]) + std::string(1, data[6])).c_str()};
+                const char *key_value_pairs[] = {"temperature", temperature_str.c_str(),
+                                                "humidity", humidity_str.c_str(),
+                                                "dust", dust_str.c_str()};
                 int num_pairs = sizeof(key_value_pairs) / sizeof(key_value_pairs[0]);
                 const char *argv[num_pairs * 2 + 1];
                 argv[0] = "MSET";
@@ -200,9 +213,10 @@ void serialProcess(long* ptr_run, named_mutex& mutex_run) {
 
                 // 发送 MSET 命令
                 redisReply *reply = (redisReply *)redisCommandArgv(redisContext, num_pairs + 1, argv, NULL);
-                if (reply == NULL) {
-                    printf("Command execution error\n");
-
+                if (reply) {
+                    freeReplyObject(reply);
+                } else {
+                    std::cerr << "Failed to execute MSET command" << std::endl;
                 }
             }else if (data_to_read[0] == 'C'){
                 scoped_lock<named_mutex> lock_run(mutex_run);
@@ -213,8 +227,7 @@ void serialProcess(long* ptr_run, named_mutex& mutex_run) {
         }  
     }catch(std::exception& e){
         std::cerr << "Exception caught in Serial Process: " << e.what() << std::endl;
-    }
-    redisFree(redisContext);  
+    }  
     std::cerr << "Serial Process ends" << std::endl; 
 }
 
@@ -223,12 +236,6 @@ void inferenceProcess(void* ptr_img, named_mutex& mutex_img,
                      boost::atomic<bool>* ptr_stop, named_mutex& mutex_stop,
                      boost::atomic<bool>* ptr_save, named_mutex& mutex_save,
                      long* ptr_run, named_mutex& mutex_run) {
-    // 连接redis
-    redisContext* redisContext = redisConnect(redis_host, redis_port);
-    if (redisContext && redisContext->err) {
-        std::cerr << "Failed to connect to Redis: " << redisContext->errstr << std::endl;
-        return ;
-    }
 	// std::this_thread::sleep_for(std::chrono::milliseconds(5000));  // 睡眠一定时间模拟推理耗时
     // 在这里加入初始化图像分类模型的代码
 	//environment （设置为VERBOSE（ORT_LOGGING_LEVEL_VERBOSE）时，方便控制台输出时看到是使用了cpu还是gpu执行）
@@ -261,87 +268,94 @@ void inferenceProcess(void* ptr_img, named_mutex& mutex_img,
     long nums = 0;
     long bad = 0;
     bool run = false;
-    while (!stop) {
-        //获取当前stop信息
-        scoped_lock<named_mutex> lock_stop(mutex_stop);
-        stop = *ptr_stop;
-        lock_stop.unlock();
-        clock_t startTime, endTime;
-        startTime = clock();
+    try{
+        RedisConnection redisConnection(redis_host, redis_port);
+        redisContext* redisContext = redisConnection.getContext();
+        while (!stop) {
+            //获取当前stop信息
+            scoped_lock<named_mutex> lock_stop(mutex_stop);
+            stop = *ptr_stop;
+            lock_stop.unlock();
+            clock_t startTime, endTime;
+            startTime = clock();
 
-        //查看是否有传感器触发
-        scoped_lock<named_mutex> lock_run(mutex_run);
-        if (*ptr_run != nums){
-            nums = *ptr_run;
-            lock_run.unlock();
-        }else{
-            lock_run.unlock();
-            continue;
-        }
-        
-        scoped_lock<named_mutex> lock_img(mutex_img);
-        // 从共享内存读取图像数据
-        cv::Mat image(Size(640, 480), CV_8UC3);
-        std::memcpy(image.data, ptr_img, imageSize);
-        // 解锁互斥锁
-        lock_img.unlock();
-        // cv::imwrite("src.png", frame);
-
-        Mat det1, det2;
-        resize(image, det1, Size(448, 448), INTER_AREA);
-        det1.convertTo(det1, CV_32FC3);
-        PreProcess(det1, det2);         //标准化处理
-        Mat blob = dnn::blobFromImage(det2, 1., Size(448, 448), Scalar(0, 0, 0), false, true);
-
-        //创建输入tensor
-        auto memory_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
-        std::vector<Ort::Value> input_tensors;
-        input_tensors.emplace_back(Ort::Value::CreateTensor<float>(memory_info, blob.ptr<float>(), blob.total(), input_dims.data(), input_dims.size()));
-        /*cout << int(input_dims.size()) << endl;*/
-
-        //(score model & input tensor, get back output tensor)
-        auto output_tensors = session.Run(Ort::RunOptions{ nullptr }, input_node_names.data(), input_tensors.data(), input_names.size(), output_node_names.data(), output_node_names.size());
-
-        assert(output_tensors.size() == 1 && output_tensors.front().IsTensor());
-
-        // 获取输出(Get pointer to output tensor float values)
-        float* floatarr = output_tensors[0].GetTensorMutableData<float>();     // 也可以使用output_tensors.front(); 获取list中的第一个元素变量  list.pop_front(); 删除list中的第一个位置的元素
-        // 得到最可能分类输出
-        Mat newarr = Mat_<double>(1, 2); //定义一个1*1000的矩阵
-
-        for (int j = 0; j < newarr.cols; j++) //矩阵列数循环
-        {
-            newarr.at<double>(0, j) = floatarr[j];
-        }
-        /*cout << newarr.size() << endl;*/
-
-        // vector<String> labels = readClassNames();
-        Point classNumber;
-        double classProb;
-        Mat probMat = newarr(Rect(0, 0, 2, 1)).clone();
-        Mat result = probMat.reshape(1, 1);
-        minMaxLoc(result, NULL, &classProb, NULL, &classNumber);
-        int classidx = classNumber.x;
-        if (classidx ==1){
-            scoped_lock<named_mutex> lock_save(mutex_save);
-            *ptr_save = true;
-            lock_save.unlock();
-            bad += 1;
-            redisReply *reply = (redisReply *)redisCommand(redisContext, "SET %s %d", resultKey, bad);
-            if (reply == NULL) {
-                printf("Error in SET command: %s\n", redisContext->errstr);
+            //查看是否有传感器触发
+            scoped_lock<named_mutex> lock_run(mutex_run);
+            if (*ptr_run != nums){
+                nums = *ptr_run;
+                lock_run.unlock();
+            }else{
+                lock_run.unlock();
+                continue;
             }
-            printf("SET command reply: %s\n", reply->str);
-            freeReplyObject(reply);
+            
+            scoped_lock<named_mutex> lock_img(mutex_img);
+            // 从共享内存读取图像数据
+            cv::Mat image(Size(640, 480), CV_8UC3);
+            std::memcpy(image.data, ptr_img, imageSize);
+            // 解锁互斥锁
+            lock_img.unlock();
+            // cv::imwrite("src.png", frame);
+
+            Mat det1, det2;
+            resize(image, det1, Size(448, 448), INTER_AREA);
+            det1.convertTo(det1, CV_32FC3);
+            PreProcess(det1, det2);         //标准化处理
+            Mat blob = dnn::blobFromImage(det2, 1., Size(448, 448), Scalar(0, 0, 0), false, true);
+
+            //创建输入tensor
+            auto memory_info = Ort::MemoryInfo::CreateCpu(OrtAllocatorType::OrtArenaAllocator, OrtMemType::OrtMemTypeDefault);
+            std::vector<Ort::Value> input_tensors;
+            input_tensors.emplace_back(Ort::Value::CreateTensor<float>(memory_info, blob.ptr<float>(), blob.total(), input_dims.data(), input_dims.size()));
+            /*cout << int(input_dims.size()) << endl;*/
+
+            //(score model & input tensor, get back output tensor)
+            auto output_tensors = session.Run(Ort::RunOptions{ nullptr }, input_node_names.data(), input_tensors.data(), input_names.size(), output_node_names.data(), output_node_names.size());
+
+            assert(output_tensors.size() == 1 && output_tensors.front().IsTensor());
+
+            // 获取输出(Get pointer to output tensor float values)
+            float* floatarr = output_tensors[0].GetTensorMutableData<float>();     // 也可以使用output_tensors.front(); 获取list中的第一个元素变量  list.pop_front(); 删除list中的第一个位置的元素
+            // 得到最可能分类输出
+            Mat newarr = Mat_<double>(1, 2); //定义一个1*1000的矩阵
+
+            for (int j = 0; j < newarr.cols; j++) //矩阵列数循环
+            {
+                newarr.at<double>(0, j) = floatarr[j];
+            }
+            /*cout << newarr.size() << endl;*/
+
+            // vector<String> labels = readClassNames();
+            Point classNumber;
+            double classProb;
+            Mat probMat = newarr(Rect(0, 0, 2, 1)).clone();
+            Mat result = probMat.reshape(1, 1);
+            minMaxLoc(result, NULL, &classProb, NULL, &classNumber);
+            int classidx = classNumber.x;
+            if (classidx ==1){
+                scoped_lock<named_mutex> lock_save(mutex_save);
+                *ptr_save = true;
+                lock_save.unlock();
+                bad += 1;
+                std::string stringValue = std::to_string(bad);
+                redisReply *reply = (redisReply *)redisCommand(redisContext, "SET %s %s", resultKey, stringValue.c_str());
+                if (reply == NULL) {
+                    printf("Error in SET command: %s\n", redisContext->errstr);
+                }else{
+                    freeReplyObject(reply);
+                }
+            }
+            // printf("\n current image classification : %s, possible : %.2f\n", labels.at(classidx).c_str(), classProb);
+            // printf("\n current image classification : %d, possible : %.2f\n", classidx, classProb);
+            endTime = clock();
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+            std::cout << "The Inference time is:" << (double)(endTime - startTime) / CLOCKS_PER_SEC << "s" << std::endl;
+            // spdlog::info("The Inference time is:{}s", (double)(endTime - startTime) / CLOCKS_PER_SEC);
         }
-        // printf("\n current image classification : %s, possible : %.2f\n", labels.at(classidx).c_str(), classProb);
-        // printf("\n current image classification : %d, possible : %.2f\n", classidx, classProb);
-        endTime = clock();
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-         std::cout << "The Inference time is:" << (double)(endTime - startTime) / CLOCKS_PER_SEC << "s" << std::endl;
-        // spdlog::info("The Inference time is:{}s", (double)(endTime - startTime) / CLOCKS_PER_SEC);
+    }catch(std::exception& e){
+        std::cerr << "Exception caught in Inference Process: " << e.what() << std::endl;
     }
-    redisFree(redisContext);
+
     std::cerr << "Inference Process ends" << std::endl;
 }
 
@@ -349,12 +363,7 @@ void saveVideoProcess(void* ptr_img, named_mutex& mutex_img,
                      boost::atomic<bool>* ptr_stop, named_mutex& mutex_stop,
                      boost::atomic<bool>* ptr_save, named_mutex& mutex_save,
                      long* ptr_nums, named_mutex& mutex_nums) {
-    // 连接redis
-    redisContext* redisContext = redisConnect(redis_host, redis_port);
-    if (redisContext && redisContext->err) {
-        std::cerr << "Failed to connect to Redis: " << redisContext->errstr << std::endl;
-        return ;
-    }
+
     // 定义视频编码器和写入对象
     int fourcc = cv::VideoWriter::fourcc('M', 'P', '4', 'V');
     cv::Size frameSize(640, 480);  // 你需要根据相机数据的分辨率调整这里 
@@ -363,6 +372,8 @@ void saveVideoProcess(void* ptr_img, named_mutex& mutex_img,
     std::vector<cv::Mat> imageVector;
     // std::this_thread::sleep_for(std::chrono::milliseconds(8000));  // 睡眠一定时间模拟推理耗时
     try{
+        RedisConnection redisConnection(redis_host, redis_port);
+        redisContext* redisContext = redisConnection.getContext();
         while (!stop) {
             //获取当前stop信息
             scoped_lock<named_mutex> lock_stop(mutex_stop);
@@ -389,7 +400,7 @@ void saveVideoProcess(void* ptr_img, named_mutex& mutex_img,
             if (imageVector.size() <= max_video_size){
                 continue;
             }
-            image.pop_back();
+            imageVector.pop_back();
 
             //获取当前save信息
             scoped_lock<named_mutex> lock_save(mutex_save);
@@ -421,7 +432,6 @@ void saveVideoProcess(void* ptr_img, named_mutex& mutex_img,
     }catch(std::exception& e){
         std::cerr << "Exception caught in Capture Process: " << e.what() << std::endl;
     }
-    redisFree(redisContext);
     std::cerr << "Save Process ends" << std::endl;
 }
 
@@ -535,23 +545,21 @@ int main() {
 
     }catch (const boost::interprocess::interprocess_exception& e) {
         std::cerr << "Exception caught: " << e.what() << std::endl;
-        if (shared_memory_object::remove("shared_image")) {
-            std::cout << "Shared memory object successfully removed." << std::endl;
-        }
-        if (shared_memory_object::remove("shared_stop")) {
-            std::cout << "Shared memory object successfully removed." << std::endl;
-        }
-        if (shared_memory_object::remove("shared_save")) {
-            std::cout << "Shared memory object successfully removed." << std::endl;
-        }
-        if (shared_memory_object::remove("shared_nums")) {
-            std::cout << "Shared memory object successfully removed." << std::endl;
-        }
+
     }catch(const std::exception& e){
         std::cerr << "Exception caught: " << e.what() << std::endl;
     }
-
-    std::cout << "Parent process, PID: " << getpid() << " waiting for all child processes to finish." << std::endl;
+    shared_memory_object::remove("shared_image");
+    shared_memory_object::remove("shared_stop");
+    shared_memory_object::remove("shared_save");
+    shared_memory_object::remove("shared_nums");
+    shared_memory_object::remove("shared_run");
+    named_mutex::remove("mutex_image");
+    named_mutex::remove("mutex_stop");
+    named_mutex::remove("mutex_save");
+    named_mutex::remove("mutex_nums");
+    named_mutex::remove("mutex_run");
+    std::cout << "Parent process finish." << std::endl;
 
     return 0;  // 父进程结束
 }
